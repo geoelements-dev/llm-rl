@@ -2,7 +2,7 @@
 
 ## Vista Installation
 ```
-git clone git@github.com:geoelements-dev/llm-rl.git
+git clone https://github.com/geoelements-dev/llm-rl.git
 cd llm-rl
 python -m ensurepip --upgrade
 pip install virtualenv --user
