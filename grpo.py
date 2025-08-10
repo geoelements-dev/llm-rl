@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from transformers import AutoTokenizer, AutoModelForCausalLM, StoppingCriteria, StoppingCriteriaList
+from torch.nn.utils.rnn import pad_sequence
 
 # ------------------------------
 # Environment / Determinism
@@ -39,14 +40,11 @@ MODEL_NAME = "google/gemma-2b-it"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
-# GRPO requires right-side padding for batch processing of log-probabilities
 tokenizer.padding_side = "right"
 
-# We don't need the ValueHead for GRPO, so we use the base model.
 fp = dict(trust_remote_code=True, torch_dtype=torch.bfloat16 if DEVICE.type == "cuda" else torch.float32)
 policy = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **fp).to(DEVICE)
 
-# Gradient checkpointing + disable cache
 if hasattr(policy, "gradient_checkpointing_enable"):
     try:
         policy.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
@@ -58,15 +56,14 @@ if hasattr(policy.config, "use_cache"):
 # ------------------------------
 # GRPO & Training Configuration
 # ------------------------------
-LEARNING_RATE = 3e-6
+LEARNING_RATE = 5e-6
 EPOCHS = 600
 LOG_EVERY = 10
-BATCH_SIZE = 4 # Number of prompts per step
-GRAD_ACCUM_STEPS = 4 # Effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS
+BATCH_SIZE = 4
+GRAD_ACCUM_STEPS = 4
 
-# --- GRPO-Specific Hyperparameters ---
-N_CANDIDATES = 4 # Number of responses to generate per prompt (group size)
-BETA = 0.1 # GRPO loss scaling factor, similar to KL penalty in PPO
+N_CANDIDATES = 4
+BETA = 2.0 # Temperature for listwise loss
 
 optimizer = AdamW(policy.parameters(), lr=LEARNING_RATE)
 print("✓ GRPO setup and AdamW optimizer initialized")
@@ -95,18 +92,16 @@ DEFAULT_SERVICE_RATIO = 350
 MAX_PROMPT_TOKENS = 384
 MAX_NEW_TOKENS = 24
 
-# Generation for GRPO requires sampling to get diverse candidates
 GEN_KWARGS_GRPO = dict(
     max_new_tokens=MAX_NEW_TOKENS,
     do_sample=True,
-    temperature=0.8,
+    temperature=0.6,
     top_k=50,
     pad_token_id=tokenizer.pad_token_id,
     eos_token_id=tokenizer.eos_token_id,
     num_return_sequences=N_CANDIDATES
 )
 
-# Generation for final evaluation (greedy)
 GEN_KWARGS_EVAL = dict(
     min_new_tokens=6,
     max_new_tokens=MAX_NEW_TOKENS,
@@ -169,7 +164,6 @@ def parse_design(text: str):
     return {"material": material, "width": w, "height": h}
 
 def evaluate_beam_design(design: Dict, env: Dict) -> Dict:
-    # This function now returns only the physics metrics, not a reward.
     mat = MATERIAL_PROPERTIES.get(design.get("material"))
     if not mat or design.get("width", 0) <= 0 or design.get("height", 0) <= 0:
         return {"invalid": True, "reason": "bad_parse"}
@@ -196,44 +190,73 @@ def evaluate_beam_design(design: Dict, env: Dict) -> Dict:
     }
 
 # ------------------------------
-# GRPO Preference Model
+# GRPO Preference Model (High Utilization)
 # ------------------------------
 def find_best_in_group(designs: List[str], env: Dict) -> int:
     """
-    This is the core of GRPO's preference modeling.
-    It ranks designs based on a clear engineering hierarchy.
-    Returns the index of the best design in the list.
+    MODIFICATION: This new preference model creates a "sweet spot" score
+    that heavily rewards high utilization (near 90%) and penalizes both
+    under-utilization (<30%) and over-engineering.
     """
     best_idx = -1
-    # Score: (is_valid, is_stress_ok, is_deflection_ok, negative_weight)
-    # We use negative weight because we want to maximize it (i.e., minimize weight)
-    best_score = (-1, -1, -1, -float('inf'))
+    best_score = -float('inf')
+
+    TARGET_UTIL = 0.9  # The ideal utilization (90%)
+    MIN_UTIL = 0.3     # The minimum acceptable utilization (30%)
+    
+    # Coefficients to balance the score components
+    W_UTIL = 100.0 # Strong weight for the utilization score
+    W_WEIGHT = 0.1 # Modest penalty for weight
 
     for i, text in enumerate(designs):
         parsed = parse_design(text)
         if not parsed:
-            score = (0, 0, 0, -float('inf')) # Invalid format is worst
+            score = -float('inf')
+            continue
+
+        metrics = evaluate_beam_design(parsed, env)
+        if metrics["invalid"]:
+            score = -float('inf')
+        # Hard failure condition
+        elif not metrics["stress_ok"] or not metrics["deflection_ok"]:
+            score = -1000.0
         else:
-            metrics = evaluate_beam_design(parsed, env)
-            if metrics["invalid"]:
-                score = (0, 0, 0, -float('inf'))
+            # --- Calculate a score for each utilization metric ---
+            
+            # Stress Utilization Score
+            stress_util = metrics['stress_util']
+            if stress_util < MIN_UTIL:
+                # Heavy penalty for being under-utilized (linear drop-off)
+                stress_score = stress_util / MIN_UTIL
             else:
-                score = (
-                    1, # Valid
-                    1 if metrics["stress_ok"] else 0,
-                    1 if metrics["deflection_ok"] else 0,
-                    -metrics["weight"] # Higher is better
-                )
+                # Gaussian-like score that peaks at TARGET_UTIL
+                # This rewards getting close to 90% and penalizes moving away
+                stress_score = np.exp(-((stress_util - TARGET_UTIL)**2) / (2 * 0.1**2))
+
+            # Deflection Utilization Score
+            defl_util = metrics['deflection_util']
+            if defl_util < MIN_UTIL:
+                # Heavy penalty for being under-utilized
+                defl_score = defl_util / MIN_UTIL
+            else:
+                # Gaussian-like score that peaks at TARGET_UTIL
+                defl_score = np.exp(-((defl_util - TARGET_UTIL)**2) / (2 * 0.1**2))
+
+            # --- Combine scores ---
+            # We multiply the scores to ensure both must be good
+            utilization_score = stress_score * defl_score
+            weight_penalty = metrics["weight"] * W_WEIGHT
+            
+            score = (W_UTIL * utilization_score) - weight_penalty
 
         if score > best_score:
             best_score = score
             best_idx = i
 
-    # If all candidates are invalid, just pick the first one.
     return best_idx if best_idx != -1 else 0
 
 # ------------------------------
-# GRPO Loss Calculation
+# GRPO Loss Calculation (Corrected)
 # ------------------------------
 def compute_grpo_loss(
     policy: torch.nn.Module,
@@ -241,69 +264,33 @@ def compute_grpo_loss(
     response_tensors: List[torch.Tensor],
     best_indices: List[int]
 ) -> torch.Tensor:
-    """
-    Calculates the GRPO loss for a batch of prompts.
-    """
-    # Combine prompts and responses for a single forward pass
-    # We need to pad them all to the same length
-    # FIX: Move response tensor `r` to CPU before concatenating with query `q`
-    padded_inputs = tokenizer(
-        [tokenizer.decode(torch.cat([q, r.cpu()])) for q, r in zip(query_tensors, response_tensors)],
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=MAX_PROMPT_TOKENS
+    full_tensors = [torch.cat([q, r.to(q.device)]) for q, r in zip(query_tensors, response_tensors)]
+    padded_tensors = pad_sequence(
+        full_tensors,
+        batch_first=True,
+        padding_value=tokenizer.pad_token_id
     ).to(DEVICE)
-
-    # Get logits from the policy model
+    attention_mask = padded_tensors.ne(tokenizer.pad_token_id).long()
     outputs = policy(
-        input_ids=padded_inputs.input_ids,
-        attention_mask=padded_inputs.attention_mask
+        input_ids=padded_tensors,
+        attention_mask=attention_mask
     )
     logits = outputs.logits
-
-    # Calculate the log probabilities of the response tokens only
-    # The shape of logits is (batch_size, seq_len, vocab_size)
-    # We shift logits to align with labels for cross-entropy calculation
     logits_shifted = logits[..., :-1, :].contiguous()
-    labels = padded_inputs.input_ids[..., 1:].contiguous()
+    labels = padded_tensors[..., 1:].contiguous()
     log_probs = F.log_softmax(logits_shifted, dim=-1)
-
-    # Gather the log probabilities of the actual tokens in the sequences
     token_log_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-
-    # Create a mask to zero out log-probs for padding tokens and prompt tokens
-    response_masks = []
+    loss_mask = torch.zeros_like(attention_mask, dtype=torch.float)
     for i, q in enumerate(query_tensors):
-        # Mask for prompt tokens is 1, for response is 1, for padding is 0
         prompt_len = q.shape[0]
-        response_len = response_tensors[i].shape[0]
-        # Attention mask already handles padding, so we just need to mask the prompt
-        mask = torch.zeros_like(labels[i], dtype=torch.bool)
-        # The relevant part of the sequence is from after the prompt to before padding
-        mask[prompt_len-1 : prompt_len + response_len-1] = True
-        response_masks.append(mask)
-
-    response_mask = torch.stack(response_masks)
-    masked_log_probs = token_log_probs * response_mask
-
-    # Sum the log-probs for each sequence to get the sequence log-probability
+        loss_mask[i, prompt_len-1:-1] = 1.0
+    masked_log_probs = token_log_probs * loss_mask[..., 1:].contiguous()
     seq_log_probs = masked_log_probs.sum(dim=-1)
-
-    # Reshape to (num_prompts, N_CANDIDATES)
     seq_log_probs = seq_log_probs.view(BATCH_SIZE, N_CANDIDATES)
-
-    # Get log_probs of the "winner" responses
+    scaled_log_probs = seq_log_probs * BETA
+    log_softmax_probs = F.log_softmax(scaled_log_probs, dim=-1)
     winner_indices = torch.tensor(best_indices, dtype=torch.long, device=DEVICE)
-    winner_log_probs = seq_log_probs.gather(dim=1, index=winner_indices.view(-1, 1)).squeeze(-1)
-
-    # Get mean log_probs for each group
-    mean_log_probs = seq_log_probs.mean(dim=1)
-
-    # Calculate the final GRPO loss
-    # This is -log_sigmoid(beta * (logp_winner - logp_mean))
-    loss = -F.logsigmoid(BETA * (winner_log_probs - mean_log_probs)).mean()
-
+    loss = -log_softmax_probs.gather(dim=1, index=winner_indices.view(-1, 1)).mean()
     return loss
 
 # ------------------------------
@@ -313,11 +300,11 @@ class ThreeLineStopper(StoppingCriteria):
     def __init__(self, tokenizer, prompt_len: int):
         self.tokenizer = tokenizer
         self.prompt_len = prompt_len
-        self.rx = re.compile(r"^\s*Material:.*\n\s*Width:.*\n\s*Height:.*\n?$", re.I | re.M)
+        self.rx = re.compile(r"Material:.*\n\s*Width:.*[0-9].*\n\s*Height:.*[0-9].*\n", re.I)
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
         resp = input_ids[0][self.prompt_len:]
         if resp.numel() == 0: return False
-        text = self.tokenizer.decode(resp, skip_special_tokens=True)
+        text = self.tokenizer.decode(resp)
         return bool(self.rx.search(text))
 
 def generate_with_stopper(model, q_ids: torch.LongTensor) -> torch.LongTensor:
@@ -326,58 +313,83 @@ def generate_with_stopper(model, q_ids: torch.LongTensor) -> torch.LongTensor:
         out = model.generate(q_ids.unsqueeze(0).to(DEVICE), stopping_criteria=stop_list, **GEN_KWARGS_EVAL)[0]
     return out.detach().cpu()
 
-def run_eval(eval_model, n_samples=20):
+def run_eval(eval_model, n_samples=20, is_final_eval=False):
     eval_model.eval()
     success_count = 0
     all_designs = []
-    for _ in range(n_samples):
+    # MODIFICATION: Added lists to track utilization
+    stress_utils, defl_utils = [], []
+    print_limit = 5
+    for i in range(n_samples):
         env = gen_env()
         prompt = prompt_template(env)
         ids = tokenizer(prompt, return_tensors="pt").input_ids[0]
         seq = generate_with_stopper(eval_model, ids)
         text = tokenizer.decode(seq[ids.shape[0]:], skip_special_tokens=True).strip()
+        
+        is_success = False
         design = parse_design(text)
         if design:
             metrics = evaluate_beam_design(design, env)
             if not metrics["invalid"] and metrics["stress_ok"] and metrics["deflection_ok"]:
                 success_count += 1
-            all_designs.append(text)
+                is_success = True
+                # MODIFICATION: Record utilization for successful designs
+                stress_utils.append(metrics['stress_util'])
+                defl_utils.append(metrics['deflection_util'])
+        
+        if (is_final_eval or i < print_limit):
+            print("-" * 50)
+            print(f"Eval Sample {i+1}/{n_samples} | Success: {'✅' if is_success else '❌'}")
+            print(f"  Load: {env['load_P']:.0f}N, Length: {env['length']:.2f}m, L/{env['service_ratio']}")
+            print(f"  Generated: {repr(text)}")
+            if design and not metrics.get("invalid"):
+                print(f"  Metrics: Stress OK? {metrics['stress_ok']}, Deflection OK? {metrics['deflection_ok']}")
+                print(f"           Stress Util: {metrics['stress_util']:.2%}, Defl Util: {metrics['deflection_util']:.2%}")
+
+        all_designs.append(text)
+
     eval_model.train()
-    return {"success_rate": success_count / n_samples, "example_design": all_designs[0] if all_designs else "N/A"}
+    
+    # MODIFICATION: Calculate and return average utilization
+    avg_stress_util = np.mean(stress_utils) if stress_utils else 0.0
+    avg_defl_util = np.mean(defl_utils) if defl_utils else 0.0
+    
+    return {
+        "success_rate": success_count / n_samples,
+        "avg_stress_util": avg_stress_util,
+        "avg_defl_util": avg_defl_util,
+        "example_design": all_designs[0] if all_designs else "N/A"
+    }
 
 # ------------------------------
 # Training Loop
 # ------------------------------
 print("\n🔎 Initial evaluation...")
 initial = run_eval(policy, n_samples=50)
-print(f"Initial | Success Rate: {initial['success_rate']:.1%}")
+print(f"Initial | Success Rate: {initial['success_rate']:.1%} | Avg Stress Util: {initial['avg_stress_util']:.1%} | Avg Defl Util: {initial['avg_defl_util']:.1%}")
 
 total_loss = 0.0
 best_success_rate = initial['success_rate']
 
 print("\n🚀 Starting GRPO Training...")
 for ep in range(1, EPOCHS + 1):
-    # --- Generate a batch of prompts ---
     envs = [gen_env() for _ in range(BATCH_SIZE)]
     prompts = [prompt_template(e) for e in envs]
     query_tensors = [tokenizer(p, return_tensors="pt").input_ids.squeeze(0) for p in prompts]
 
-    # --- Generate N candidates for each prompt ---
     policy.eval()
     response_tensors_flat = []
     with torch.no_grad():
         for q in query_tensors:
-            # Generate N_CANDIDATES for each query
             full_outputs = policy.generate(
                 q.unsqueeze(0).to(DEVICE),
                 **GEN_KWARGS_GRPO
             )
-            # Strip prompt from each candidate
             responses = [full[q.shape[0]:] for full in full_outputs]
             response_tensors_flat.extend(responses)
     policy.train()
 
-    # --- Decode and find the best candidate for each prompt ---
     decoded_responses = tokenizer.batch_decode(response_tensors_flat, skip_special_tokens=True)
     best_indices = []
     valid_in_batch = 0
@@ -387,7 +399,6 @@ for ep in range(1, EPOCHS + 1):
         group = decoded_responses[start_idx:end_idx]
         best_idx_in_group = find_best_in_group(group, envs[i])
         best_indices.append(best_idx_in_group)
-        # For logging, check if the winner was valid
         winner_text = group[best_idx_in_group]
         winner_parsed = parse_design(winner_text)
         if winner_parsed:
@@ -395,12 +406,8 @@ for ep in range(1, EPOCHS + 1):
             if not m['invalid'] and m['stress_ok'] and m['deflection_ok']:
                 valid_in_batch += 1
 
+    query_tensors_flat = [q for q in query_tensors for _ in range(N_CANDIDATES)]
 
-    # --- Prepare tensors for loss calculation ---
-    # We need to repeat the query tensors N_CANDIDATES times
-    query_tensors_flat = [q.cpu() for q in query_tensors for _ in range(N_CANDIDATES)]
-
-    # --- Calculate GRPO loss and update ---
     loss = compute_grpo_loss(policy, query_tensors_flat, response_tensors_flat, best_indices)
     (loss / GRAD_ACCUM_STEPS).backward()
     total_loss += loss.item()
@@ -410,9 +417,8 @@ for ep in range(1, EPOCHS + 1):
         optimizer.step()
         optimizer.zero_grad()
 
-    # --- Logging ---
     if ep % LOG_EVERY == 0:
-        avg_loss = total_loss / LOG_EVERY
+        avg_loss = total_loss / LOG_EVERY if ep > 1 else total_loss
         success_rate = valid_in_batch / BATCH_SIZE
         print(
             f"Ep {ep:4d} | Avg Loss={avg_loss:7.4f} | Batch Success={success_rate:6.1%} | "
@@ -420,19 +426,19 @@ for ep in range(1, EPOCHS + 1):
         )
         total_loss = 0.0
 
-        # Run a full evaluation periodically
         if ep % (LOG_EVERY * 5) == 0:
-            eval_results = run_eval(policy, n_samples=50)
-            print(f"  > Eval Success Rate: {eval_results['success_rate']:.1%}")
+            print("\n--- Periodic Evaluation ---")
+            eval_results = run_eval(policy, n_samples=20)
+            print(f"  > Eval Success: {eval_results['success_rate']:.1%} | Avg Stress: {eval_results['avg_stress_util']:.1%} | Avg Defl: {eval_results['avg_defl_util']:.1%}")
+            print("-------------------------\n")
             if eval_results['success_rate'] > best_success_rate:
                 best_success_rate = eval_results['success_rate']
                 print(f"  🎉 New best success rate! Saving model...")
                 save_dir = f"trained_models/gemma-2b-it-grpo_best"
+                os.makedirs(save_dir, exist_ok=True)
                 policy.save_pretrained(save_dir)
                 tokenizer.save_pretrained(save_dir)
 
-
-    # --- Memory hygiene ---
     del query_tensors, response_tensors_flat, query_tensors_flat, decoded_responses, loss
     if DEVICE.type == "cuda": torch.cuda.empty_cache()
     elif DEVICE.type == "mps": torch.mps.empty_cache()
@@ -450,11 +456,12 @@ policy.save_pretrained(save_dir)
 tokenizer.save_pretrained(save_dir)
 
 print("🔎 Final evaluation (100 samples)...")
-final = run_eval(policy, n_samples=100)
-print(f"Final  | Success Rate: {final['success_rate']:.1%}")
+final = run_eval(policy, n_samples=100, is_final_eval=True)
+print(f"Final  | Success Rate: {final['success_rate']:.1%} | Avg Stress Util: {final['avg_stress_util']:.1%} | Avg Defl Util: {final['avg_defl_util']:.1%}")
 
 print("\n📊 Summary")
 print(f"    Initial Success: {initial['success_rate']:.1%}")
 print(f"    Final Success  : {final['success_rate']:.1%}")
-print(f"    Saved to       : {save_dir}")
-
+print(f"\n    Avg Stress Util: {initial['avg_stress_util']:.1%} -> {final['avg_stress_util']:.1%}")
+print(f"    Avg Defl Util  : {initial['avg_defl_util']:.1%} -> {final['avg_defl_util']:.1%}")
+print(f"\n    Saved to       : {save_dir}")
